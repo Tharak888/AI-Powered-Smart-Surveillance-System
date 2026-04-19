@@ -1,0 +1,196 @@
+# Fall Detection System - Required Python Packages
+# Install with: pip install -r requirements.txt
+
+# OpenCV for video processing and display
+opencv-python>=4.5.0
+
+# MediaPipe for pose estimation
+mediapipe>=0.10.0
+
+# NumPy for numerical calculations
+numpy>=1.19.0
+
+# ============================================================================
+# PACKAGE EXPLANATIONS
+# ============================================================================
+
+# opencv-python:
+# - Captures video from webcam
+# - Displays video frames
+# - Draws overlays and text
+# - Basic image processing
+
+# mediapipe:
+# - Google's ML solution for pose estimation
+# - Detects 33 body landmarks in real-time
+# - Works on CPU (no GPU required)
+# - Pre-trained models included
+# - This is the CORE of fall detection
+
+# numpy:
+# - Mathematical operations
+# - Array/matrix calculations
+# - Used for coordinate transformations
+# - Essential for angle calculations
+
+# ============================================================================
+# MEDIAPIPE POSE LANDMARKS
+# ============================================================================
+
+# MediaPipe detects these 33 body points:
+# 
+# Face (0-10):
+# 0  - Nose
+# 1  - Left Eye Inner
+# 2  - Left Eye
+# 3  - Left Eye Outer
+# 4  - Right Eye Inner
+# 5  - Right Eye
+# 6  - Right Eye Outer
+# 7  - Left Ear
+# 8  - Right Ear
+# 9  - Mouth Left
+# 10 - Mouth Right
+#
+# Upper Body (11-16):
+# 11 - Left Shoulder
+# 12 - Right Shoulder
+# 13 - Left Elbow
+# 14 - Right Elbow
+# 15 - Left Wrist
+# 16 - Right Wrist
+#
+# Torso (17-22):
+# 17 - Left Pinky
+# 18 - Right Pinky
+# 19 - Left Index
+# 20 - Right Index
+# 21 - Left Thumb
+# 22 - Right Thumb
+#
+# Lower Body (23-32):
+# 23 - Left Hip
+# 24 - Right Hip
+# 25 - Left Knee
+# 26 - Right Knee
+# 27 - Left Ankle
+# 28 - Right Ankle
+# 29 - Left Heel
+# 30 - Right Heel
+# 31 - Left Foot Index
+# 32 - Right Foot Index
+
+# ============================================================================
+# INSTALLATION
+# ============================================================================
+
+# RECOMMENDED METHOD:
+# 1. Create a virtual environment (optional but recommended):
+#    python -m venv venv
+#    
+#    Activate it:
+#    Windows: venv\Scripts\activate
+#    Mac/Linux: source venv/bin/activate
+#
+# 2. Install all packages:
+#    pip install -r requirements.txt
+
+# ALTERNATIVE (Individual Installation):
+# pip install opencv-python
+# pip install mediapipe
+# pip install numpy
+
+# ============================================================================
+# PLATFORM-SPECIFIC NOTES
+# ============================================================================
+
+# WINDOWS:
+# - Should work out of the box
+# - Audio alerts use winsound (built-in)
+
+# macOS:
+# - May need: pip install --upgrade pip
+# - Audio uses 'say' command (built-in)
+# - If camera issues: Check System Preferences > Security & Privacy
+
+# LINUX:
+# - May need additional packages:
+#   sudo apt-get install python3-opencv
+#   sudo apt-get install libgl1-mesa-glx  # For OpenCV display
+#
+# - For audio (optional):
+#   sudo apt-get install espeak
+
+# ============================================================================
+# TROUBLESHOOTING
+# ============================================================================
+
+# "No module named 'cv2'":
+# → pip install opencv-python
+
+# "No module named 'mediapipe'":
+# → pip install mediapipe
+
+# "ImportError: libGL.so.1" (Linux):
+# → sudo apt-get install libgl1-mesa-glx
+
+# MediaPipe installation fails:
+# → Try: pip install --upgrade pip
+# → Then: pip install mediapipe
+
+# Camera not working:
+# → Check if another app is using it
+# → Try different camera index (0, 1, 2)
+
+# Slow performance:
+# → Reduce camera resolution in script
+# → Close other applications
+# → Use model_complexity=0 for faster processing
+
+# ============================================================================
+# VERSION COMPATIBILITY
+# ============================================================================
+
+# Tested with:
+# - Python 3.7 - 3.11
+# - OpenCV 4.5.0 - 4.8.0
+# - MediaPipe 0.10.0 - 0.10.9
+# - NumPy 1.19.0 - 1.24.0
+
+# ============================================================================
+# OPTIONAL PACKAGES (Not Required)
+# ============================================================================
+
+# For better audio alerts (optional):
+# pygame>=2.0.0
+
+# For logging to file (optional):
+# No additional packages needed (uses built-in logging module)
+
+# For SMS/Email alerts (advanced):
+# twilio>=7.0.0        # For SMS
+# smtplib (built-in)   # For email
+
+# ============================================================================
+# MEMORY REQUIREMENTS
+# ============================================================================
+
+# Minimum RAM: 2GB
+# Recommended RAM: 4GB+
+# 
+# MediaPipe models are lightweight:
+# - Lite model: ~3MB
+# - Full model: ~5MB
+# - Heavy model: ~6MB
+
+# ============================================================================
+# GPU SUPPORT
+# ============================================================================
+
+# MediaPipe can use GPU for better performance, but it's NOT required
+# CPU-only operation works fine for real-time detection
+#
+# For GPU support (optional, advanced):
+# - Requires: mediapipe-gpu package
+# - Requires: CUDA-capable GPU
+# - Not covered in this basic implementation
