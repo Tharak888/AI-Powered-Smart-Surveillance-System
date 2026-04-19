@@ -1,0 +1,1121 @@
+"""
+╔════════════════════════════════════════════════════════════════════════════╗
+║                  ULTIMATE THEFT DETECTION SYSTEM v2.1 (FIXED)              ║
+║                    Multi-Strategy Hybrid Approach                          ║
+╚════════════════════════════════════════════════════════════════════════════╝
+
+BUG FIXES APPLIED:
+==================
+ FIX 1  calculate_iou()         — inter_xmax used y2_max instead of x2_max (wrong axis)
+ FIX 2  ObjectTracker.update()  — scipy imported inside method every frame; moved to top-level
+ FIX 3  check_theft_confirmation() — only checked TAKEN status; also checks PICKED_UP so quick
+                                     exits aren't missed
+ FIX 4  check_loitering()       — MOVEMENT_THRESHOLD 50px was too sensitive on 640x480;
+                                   raised to 15px (avg across 5 frames) + smoothed with median
+ FIX 5  check_protected_object() — centroid param was unused; now uses it for distance-based
+                                    person-proximity check instead of re-reading bbox
+ FIX 6  determine_object_origin() — called get_tracked_objects() inside a per-object loop,
+                                    causing redundant full rebuilds; now uses cached snapshot
+ FIX 7  check_person_object_interaction() — same redundant get_tracked_objects() call; fixed
+ FIX 8  mouse_callback          — added nonlocal for current_zone_points to be explicit & safe
+ FIX 9  Zone key handler        — pressing 'o'/'e'/'z' while already drawing a different zone
+                                   type now finishes the current zone first before starting new
+ FIX 10 calculate_iou()         — added zero-area guard to prevent division by zero
+"""
+
+import cv2
+import numpy as np
+import time
+import math
+import sys
+import json
+import os
+from collections import defaultdict, deque
+from enum import Enum
+from datetime import datetime
+
+# ============================================================================
+# IMPORTS & INITIALIZATION
+# ============================================================================
+
+try:
+    from ultralytics import YOLO
+    print("✓ Ultralytics YOLO imported successfully")
+except ImportError:
+    print("❌ Error: ultralytics not installed. Install with: pip install ultralytics")
+    sys.exit(1)
+
+# FIX 2: Import scipy at module level (was buried inside update() method, causing
+#         an ImportError crash on every frame if not installed)
+try:
+    from scipy.spatial import distance as scipy_dist
+    print("✓ SciPy imported successfully")
+except ImportError:
+    print("❌ Error: scipy not installed. Install with: pip install scipy")
+    sys.exit(1)
+
+try:
+    import winsound
+    AUDIO_TYPE = 'windows'
+except ImportError:
+    AUDIO_TYPE = 'unix'
+
+# ============================================================================
+# CONFIGURATION
+# ============================================================================
+
+CONFIDENCE_THRESHOLD = 0.5
+IOU_THRESHOLD         = 0.4
+MODEL_SIZE            = 'yolov8n.pt'
+
+TRACKED_CLASSES = {
+    0:  'person',
+    24: 'backpack',
+    26: 'handbag',
+    28: 'suitcase',
+    63: 'laptop',
+    67: 'cell phone',
+    73: 'book',
+}
+
+# Theft Detection
+PICKUP_DISTANCE_THRESHOLD = 150
+TIME_BEFORE_ALERT         = 5.0
+ITEM_RETURN_DISTANCE      = 80
+
+# Tracking
+MAX_DISAPPEARED = 30
+MAX_DISTANCE    = 100
+
+# Loitering — FIX 4: threshold tuned; MOVEMENT_THRESHOLD is average pixel
+#              movement per frame-sample across 5 recent positions (15 is
+#              appropriate for typical YOLO jitter on a stationary object)
+LOITER_THRESHOLD   = 10.0   # seconds stationary before alert
+MOVEMENT_THRESHOLD = 15     # FIX 4: was 50 — too high, stationary person would
+                            #         never trigger; 15px avg is more realistic
+CHECK_INTERVAL     = 0.5
+
+# Zone / Files
+ZONE_FILE = 'zones/ultimate_zones.json'
+
+# Alerts
+ENABLE_SOUND_ALERT  = True
+ENABLE_VISUAL_ALERT = True
+ENABLE_LOGGING      = True
+
+# Display
+SHOW_TRACKING_IDS = True
+SHOW_CONFIDENCE   = True
+SHOW_ZONES        = True
+SHOW_STATISTICS   = True
+SHOW_ALERTS       = True
+
+# Camera
+CAMERA_INDEX  = 0
+CAMERA_WIDTH  = 640
+CAMERA_HEIGHT = 480
+
+# Colors (BGR)
+COLOR_NORMAL         = (0, 255,   0)
+COLOR_WARNING        = (0, 165, 255)
+COLOR_DANGER         = (0,   0, 255)
+COLOR_SECURE_ZONE    = (0, 255,   0)
+COLOR_EXIT_ZONE      = (0,   0, 255)
+COLOR_RESTRICTED_ZONE= (255,  0, 255)
+COLOR_PERSON         = (255, 255,  0)
+COLOR_OBJECT         = (0,  255, 255)
+COLOR_STOLEN         = (0,    0, 255)
+COLOR_TEXT           = (255, 255, 255)
+COLOR_LOCKED         = (255,   0, 255)
+
+# ============================================================================
+# ENUMS
+# ============================================================================
+
+class ZoneType(Enum):
+    SECURE     = "secure"
+    EXIT       = "exit"
+    RESTRICTED = "restricted"
+
+class ObjectOrigin(Enum):
+    SECURE_ZONE = "secure_zone"
+    WITH_PERSON = "with_person"
+    UNKNOWN     = "unknown"
+
+class TheftStatus(Enum):
+    MONITORING        = "monitoring"
+    PICKED_UP         = "picked_up"
+    TAKEN             = "taken"
+    THEFT_CONFIRMED   = "theft_confirmed"
+
+class AlertType(Enum):
+    THEFT             = "theft"
+    LOITERING         = "loitering"
+    RESTRICTED        = "restricted"
+    SUSPICION         = "suspicion"
+    OBJECT_PROTECTION = "object_protection"
+
+# ============================================================================
+# UTILITY FUNCTIONS
+# ============================================================================
+
+def calculate_iou(box1, box2):
+    """
+    Calculate Intersection over Union for two bounding boxes.
+
+    FIX 1: Original code had:
+        inter_xmax = min(x1_max, y2_max)   <-- BUG: y2_max is a Y-coordinate!
+    Corrected to:
+        inter_xmax = min(x1_max, x2_max)
+
+    FIX 10: Added zero-area guard to prevent ZeroDivisionError.
+    """
+    x1_min, y1_min, x1_max, y1_max = box1
+    x2_min, y2_min, x2_max, y2_max = box2
+
+    inter_xmin = max(x1_min, x2_min)
+    inter_ymin = max(y1_min, y2_min)
+    inter_xmax = min(x1_max, x2_max)   # FIX 1: was min(x1_max, y2_max) — wrong axis
+    inter_ymax = min(y1_max, y2_max)
+
+    if inter_xmax <= inter_xmin or inter_ymax <= inter_ymin:
+        return 0.0
+
+    inter_area = (inter_xmax - inter_xmin) * (inter_ymax - inter_ymin)
+    box1_area  = max(0, x1_max - x1_min) * max(0, y1_max - y1_min)
+    box2_area  = max(0, x2_max - x2_min) * max(0, y2_max - y2_min)
+    union_area = box1_area + box2_area - inter_area
+
+    return inter_area / union_area if union_area > 0 else 0.0   # FIX 10: guard
+
+
+def centroid_distance(p1, p2):
+    """Euclidean distance between two (x,y) points."""
+    return math.sqrt((p1[0] - p2[0]) ** 2 + (p1[1] - p2[1]) ** 2)
+
+
+def play_alert_sound(frequency=1200, duration=500):
+    """Play a beep alert (cross-platform best-effort)."""
+    if not ENABLE_SOUND_ALERT:
+        return
+    try:
+        if AUDIO_TYPE == 'windows':
+            winsound.Beep(frequency, duration)
+        else:
+            os.system(f'play -nq -t alsa synth {duration / 1000} sine {frequency} 2>/dev/null')
+    except Exception:
+        print("\a", end="", flush=True)
+
+# ============================================================================
+# OBJECT TRACKER
+# ============================================================================
+
+class ObjectTracker:
+    """
+    Centroid-based multi-object tracker with loitering detection,
+    theft tracking, and object protection (locking).
+    """
+
+    def __init__(self, max_disappeared=MAX_DISAPPEARED, max_distance=MAX_DISTANCE):
+        self.next_object_id = 1
+        self.objects      = {}   # id -> centroid
+        self.disappeared  = {}   # id -> frame count
+        self.bboxes       = {}
+        self.classes      = {}
+        self.confidences  = {}
+        self.max_disappeared = max_disappeared
+        self.max_distance    = max_distance
+
+        # Loitering
+        self.positions_history = defaultdict(lambda: deque(maxlen=30))
+        self.stationary_time   = {}
+        self.last_check_time   = {}
+
+        # Theft (professional)
+        self.object_origins       = {}
+        self.first_positions      = {}
+        self.theft_status         = {}
+        self.pickup_time          = {}
+        self.associated_person    = {}
+        self.object_in_secure_zone= {}
+
+        # Object protection
+        self.locked_objects   = {}   # id -> reference bbox
+        self.lock_time        = {}
+        self.protection_alerts= defaultdict(int)
+
+        # Events
+        self.all_events  = []
+        self.frame_stats = defaultdict(int)
+
+    # ------------------------------------------------------------------
+    def register(self, centroid, bbox, class_name, confidence):
+        obj_id = self.next_object_id
+        self.objects[obj_id]       = centroid
+        self.bboxes[obj_id]        = bbox
+        self.classes[obj_id]       = class_name
+        self.confidences[obj_id]   = confidence
+        self.disappeared[obj_id]   = 0
+        self.stationary_time[obj_id]  = 0.0
+        self.last_check_time[obj_id]  = time.time()
+
+        self.first_positions[obj_id]       = centroid
+        self.object_origins[obj_id]        = ObjectOrigin.UNKNOWN
+        self.theft_status[obj_id]          = TheftStatus.MONITORING
+        self.object_in_secure_zone[obj_id] = False
+
+        self.next_object_id += 1
+        return obj_id
+
+    # ------------------------------------------------------------------
+    def deregister(self, object_id):
+        attrs = [
+            'objects', 'disappeared', 'bboxes', 'classes', 'confidences',
+            'stationary_time', 'last_check_time', 'positions_history',
+            'object_origins', 'first_positions', 'theft_status',
+            'pickup_time', 'associated_person', 'object_in_secure_zone',
+            'locked_objects', 'lock_time', 'protection_alerts',
+        ]
+        for attr in attrs:
+            d = getattr(self, attr)
+            if object_id in d:
+                del d[object_id]
+
+    # ------------------------------------------------------------------
+    def update(self, detections):
+        """
+        Match new detections to existing tracks using centroid distance.
+
+        FIX 2: scipy.spatial.distance is now imported at module level,
+                not inside this method (was crashing on every frame if
+                scipy was missing, with no graceful message).
+        """
+        if not detections:
+            for object_id in list(self.disappeared.keys()):
+                self.disappeared[object_id] += 1
+                if self.disappeared[object_id] > self.max_disappeared:
+                    self.deregister(object_id)
+            return self.get_tracked_objects()
+
+        input_centroids   = np.array([d[0] for d in detections])
+        input_bboxes      = [d[1] for d in detections]
+        input_classes     = [d[2] for d in detections]
+        input_confidences = [d[3] for d in detections]
+
+        if not self.objects:
+            for i in range(len(detections)):
+                self.register(input_centroids[i], input_bboxes[i],
+                              input_classes[i], input_confidences[i])
+        else:
+            object_ids       = list(self.objects.keys())
+            object_centroids = np.array(list(self.objects.values()))
+
+            # FIX 2: use module-level scipy_dist (imported at top)
+            D    = scipy_dist.cdist(object_centroids, input_centroids)
+            rows = D.min(axis=1).argsort()
+            cols = D.argmin(axis=1)[rows]
+
+            used_rows = set()
+            used_cols = set()
+
+            for row, col in zip(rows, cols):
+                if row in used_rows or col in used_cols:
+                    continue
+                if D[row, col] > self.max_distance:
+                    continue
+
+                object_id = object_ids[row]
+                self.objects[object_id]     = input_centroids[col]
+                self.bboxes[object_id]      = input_bboxes[col]
+                self.classes[object_id]     = input_classes[col]
+                self.confidences[object_id] = input_confidences[col]
+                self.disappeared[object_id] = 0
+                self.positions_history[object_id].append(input_centroids[col])
+
+                used_rows.add(row)
+                used_cols.add(col)
+
+            for row in set(range(D.shape[0])) - used_rows:
+                object_id = object_ids[row]
+                self.disappeared[object_id] += 1
+                if self.disappeared[object_id] > self.max_disappeared:
+                    self.deregister(object_id)
+
+            for col in set(range(D.shape[1])) - used_cols:
+                self.register(input_centroids[col], input_bboxes[col],
+                              input_classes[col], input_confidences[col])
+
+        return self.get_tracked_objects()
+
+    # ------------------------------------------------------------------
+    def get_tracked_objects(self):
+        result = {}
+        for object_id in self.objects:
+            result[object_id] = {
+                'centroid':    self.objects[object_id],
+                'bbox':        self.bboxes[object_id],
+                'class':       self.classes[object_id],
+                'confidence':  self.confidences[object_id],
+                'origin':      self.object_origins.get(object_id, ObjectOrigin.UNKNOWN),
+                'theft_status':self.theft_status.get(object_id, TheftStatus.MONITORING),
+                'in_secure_zone': self.object_in_secure_zone.get(object_id, False),
+                'is_locked':   object_id in self.locked_objects,
+            }
+        return result
+
+    # ------------------------------------------------------------------
+    def lock_object(self, object_id):
+        if object_id in self.objects:
+            self.locked_objects[object_id] = self.bboxes[object_id]
+            self.lock_time[object_id]      = time.time()
+            return True
+        return False
+
+    def unlock_object(self, object_id):
+        if object_id in self.locked_objects:
+            del self.locked_objects[object_id]
+            self.lock_time.pop(object_id, None)
+            return True
+        return False
+
+    # ------------------------------------------------------------------
+    def check_loitering(self, object_id):
+        """
+        Returns (is_loitering, stationary_seconds).
+
+        FIX 4: Original MOVEMENT_THRESHOLD=50 pixels was far too coarse —
+        a genuinely stationary person's YOLO centroid still jitters a few
+        pixels every frame, so avg_movement for 5 consecutive frames of a
+        truly still person is well under 15 px.  Using 50 meant almost nobody
+        ever triggered loitering.  Threshold lowered to 15 px.
+        Also changed mean → median to be robust against single-frame outliers.
+        """
+        if object_id not in self.positions_history:
+            return False, 0.0
+
+        current_time = time.time()
+
+        if object_id in self.last_check_time:
+            elapsed_since_check = current_time - self.last_check_time[object_id]
+            if elapsed_since_check < CHECK_INTERVAL:
+                return (self.stationary_time.get(object_id, 0.0) > LOITER_THRESHOLD,
+                        self.stationary_time.get(object_id, 0.0))
+
+        history = list(self.positions_history[object_id])
+        if len(history) < 2:
+            self.last_check_time[object_id] = current_time
+            return False, 0.0
+
+        recent = history[-5:]
+        movements = [
+            math.sqrt((recent[i+1][0]-recent[i][0])**2 + (recent[i+1][1]-recent[i][1])**2)
+            for i in range(len(recent)-1)
+        ]
+
+        # FIX 4: use median instead of mean — robust to single-frame bbox jitter
+        avg_movement = float(np.median(movements)) if movements else 0.0
+
+        time_delta = current_time - self.last_check_time.get(object_id, current_time)
+
+        if avg_movement < MOVEMENT_THRESHOLD:
+            self.stationary_time[object_id] = self.stationary_time.get(object_id, 0.0) + time_delta
+        else:
+            self.stationary_time[object_id] = 0.0
+
+        self.last_check_time[object_id] = current_time
+
+        loiter_time = self.stationary_time.get(object_id, 0.0)
+        return loiter_time > LOITER_THRESHOLD, loiter_time
+
+# ============================================================================
+# ZONE MANAGER
+# ============================================================================
+
+class ZoneManager:
+    """Manages secure, exit, and restricted zones."""
+
+    def __init__(self, zone_file=ZONE_FILE):
+        self.secure_zones     = []
+        self.exit_zones       = []
+        self.restricted_zones = []
+        self.zone_file        = zone_file
+        self.load_zones()
+
+    def add_zone(self, points, zone_type):
+        if zone_type == ZoneType.SECURE:
+            self.secure_zones.append(points)
+        elif zone_type == ZoneType.EXIT:
+            self.exit_zones.append(points)
+        elif zone_type == ZoneType.RESTRICTED:
+            self.restricted_zones.append(points)
+
+    def clear_zones(self):
+        self.secure_zones     = []
+        self.exit_zones       = []
+        self.restricted_zones = []
+
+    def save_zones(self):
+        dir_ = os.path.dirname(self.zone_file)
+        if dir_:
+            os.makedirs(dir_, exist_ok=True)
+        with open(self.zone_file, 'w') as f:
+            json.dump({
+                'secure_zones':     self.secure_zones,
+                'exit_zones':       self.exit_zones,
+                'restricted_zones': self.restricted_zones,
+            }, f)
+        print(f"✓ Zones saved — secure:{len(self.secure_zones)}  "
+              f"exit:{len(self.exit_zones)}  restricted:{len(self.restricted_zones)}")
+
+    def load_zones(self):
+        if not os.path.exists(self.zone_file):
+            return
+        try:
+            with open(self.zone_file) as f:
+                data = json.load(f)
+            self.secure_zones     = data.get('secure_zones',     [])
+            self.exit_zones       = data.get('exit_zones',       [])
+            self.restricted_zones = data.get('restricted_zones', [])
+            total = len(self.secure_zones) + len(self.exit_zones) + len(self.restricted_zones)
+            if total:
+                print(f"✓ Loaded {total} zone(s)")
+        except Exception as exc:
+            print(f"⚠ Could not load zones: {exc}")
+
+    # ------------------------------------------------------------------
+    @staticmethod
+    def point_in_polygon(point, polygon):
+        """Ray-casting algorithm."""
+        x, y  = point
+        n     = len(polygon)
+        inside= False
+        p1x, p1y = polygon[0]
+        for i in range(1, n + 1):
+            p2x, p2y = polygon[i % n]
+            if y > min(p1y, p2y):
+                if y <= max(p1y, p2y):
+                    if x <= max(p1x, p2x):
+                        if p1y != p2y:
+                            xinters = (y - p1y) * (p2x - p1x) / (p2y - p1y) + p1x
+                        if p1x == p2x or x <= xinters:
+                            inside = not inside
+            p1x, p1y = p2x, p2y
+        return inside
+
+    def check_in_secure_zone(self, centroid):
+        for i, zone in enumerate(self.secure_zones):
+            if len(zone) >= 3 and self.point_in_polygon(centroid, zone):
+                return True, i
+        return False, None
+
+    def check_in_exit_zone(self, centroid):
+        for i, zone in enumerate(self.exit_zones):
+            if len(zone) >= 3 and self.point_in_polygon(centroid, zone):
+                return True, i
+        return False, None
+
+    def check_in_restricted_zone(self, centroid):
+        for i, zone in enumerate(self.restricted_zones):
+            if len(zone) >= 3 and self.point_in_polygon(centroid, zone):
+                return True, i
+        return False, None
+
+    # ------------------------------------------------------------------
+    def draw_zones(self, frame):
+        configs = [
+            (self.secure_zones,     COLOR_SECURE_ZONE,     "SECURE"),
+            (self.exit_zones,       COLOR_EXIT_ZONE,        "EXIT"),
+            (self.restricted_zones, COLOR_RESTRICTED_ZONE,  "RESTRICTED"),
+        ]
+        for zones, color, label in configs:
+            for zone in zones:
+                if len(zone) < 2:
+                    continue
+                pts     = np.array(zone, np.int32).reshape((-1, 1, 2))
+                overlay = frame.copy()
+                cv2.fillPoly(overlay, [pts], color)
+                cv2.addWeighted(overlay, 0.2, frame, 0.8, 0, frame)
+                cv2.polylines(frame, [pts], True, color, 2)
+                cv2.putText(frame, label, tuple(zone[0]),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+
+# ============================================================================
+# THEFT DETECTOR
+# ============================================================================
+
+class TheftDetector:
+    """
+    Evaluates theft, loitering, restricted-area, and object-protection events.
+    """
+
+    def __init__(self, tracker: ObjectTracker, zone_manager: ZoneManager):
+        self.tracker      = tracker
+        self.zone_manager = zone_manager
+        self.theft_events = []
+        self.alert_history= []
+
+    # ------------------------------------------------------------------
+    def log_event(self, event_type, details):
+        event = {
+            'timestamp': datetime.now().strftime('%H:%M:%S.%f')[:-3],
+            'type':      event_type,
+            'details':   details,
+        }
+        self.theft_events.append(event)
+        if ENABLE_LOGGING:
+            print(f"[{event['timestamp']}] {event_type}: {details}")
+
+    # ------------------------------------------------------------------
+    def determine_object_origin(self, object_id, centroid, class_name,
+                                 snapshot: dict):
+        """
+        Decide whether an object originated inside a secure zone or with a person.
+
+        FIX 6: Original called self.tracker.get_tracked_objects() inside this
+                method.  That method is called once per new object inside the
+                main loop — passing the already-built snapshot avoids N
+                redundant full dict rebuilds per frame.
+        """
+        if class_name == 'person':
+            return
+
+        in_secure, _ = self.zone_manager.check_in_secure_zone(centroid)
+
+        if in_secure:
+            self.tracker.object_origins[object_id]        = ObjectOrigin.SECURE_ZONE
+            self.tracker.object_in_secure_zone[object_id] = True
+            self.log_event("ORIGIN_DETECTED",
+                           f"Object {object_id} ({class_name}) from SECURE zone")
+            return
+
+        # Check proximity to a person using the passed snapshot
+        for pid, pdata in snapshot.items():
+            if pdata['class'] != 'person' or pid == object_id:
+                continue
+            if centroid_distance(centroid, pdata['centroid']) < PICKUP_DISTANCE_THRESHOLD * 1.5:
+                self.tracker.object_origins[object_id] = ObjectOrigin.WITH_PERSON
+                self.log_event("ORIGIN_DETECTED",
+                               f"Object {object_id} ({class_name}) with person {pid}")
+                return
+
+        self.tracker.object_origins[object_id] = ObjectOrigin.UNKNOWN
+
+    # ------------------------------------------------------------------
+    def check_person_object_interaction(self, person_id, person_centroid,
+                                         snapshot: dict):
+        """
+        Detect when a person picks up an item from a secure zone.
+
+        FIX 7: Original called self.tracker.get_tracked_objects() internally.
+               Now accepts the already-built snapshot from the main loop.
+        """
+        for obj_id, obj_data in snapshot.items():
+            if obj_data['origin'] != ObjectOrigin.SECURE_ZONE:
+                continue
+            if obj_data['theft_status'] in (TheftStatus.TAKEN,
+                                             TheftStatus.THEFT_CONFIRMED):
+                continue
+
+            distance = centroid_distance(person_centroid, obj_data['centroid'])
+            if distance >= PICKUP_DISTANCE_THRESHOLD:
+                continue
+
+            in_secure, _ = self.zone_manager.check_in_secure_zone(obj_data['centroid'])
+            if not in_secure and self.tracker.theft_status[obj_id] == TheftStatus.MONITORING:
+                self.tracker.theft_status[obj_id]       = TheftStatus.PICKED_UP
+                self.tracker.pickup_time[obj_id]        = time.time()
+                self.tracker.associated_person[obj_id]  = person_id
+                self.tracker.object_in_secure_zone[obj_id] = False
+                self.log_event("PICKUP_DETECTED",
+                               f"Person {person_id} picked up Object {obj_id}")
+                return obj_id, True
+
+        return None, False
+
+    # ------------------------------------------------------------------
+    def check_item_returned(self, object_id, centroid):
+        in_secure, _ = self.zone_manager.check_in_secure_zone(centroid)
+        if in_secure:
+            if self.tracker.theft_status[object_id] in (TheftStatus.PICKED_UP,
+                                                          TheftStatus.TAKEN):
+                self.tracker.theft_status[object_id]          = TheftStatus.MONITORING
+                self.tracker.object_in_secure_zone[object_id] = True
+                self.tracker.pickup_time.pop(object_id, None)
+                self.tracker.associated_person.pop(object_id, None)
+                self.log_event("ITEM_RETURNED",
+                               f"Object {object_id} returned to secure zone")
+                return True
+        return False
+
+    # ------------------------------------------------------------------
+    def check_theft_confirmation(self, person_id, person_centroid):
+        """
+        Confirm theft when person carrying an item enters the exit zone.
+
+        FIX 3: Original only checked TheftStatus.TAKEN.  If a person moves
+               quickly toward the exit before TIME_BEFORE_ALERT elapses the
+               status is still PICKED_UP — theft would be missed.  Now checks
+               both PICKED_UP and TAKEN.
+        """
+        in_exit, _ = self.zone_manager.check_in_exit_zone(person_centroid)
+        if not in_exit:
+            return None
+
+        for obj_id, assoc_person in self.tracker.associated_person.items():
+            if assoc_person != person_id:
+                continue
+            # FIX 3: was only TheftStatus.TAKEN — now also catches PICKED_UP
+            if self.tracker.theft_status[obj_id] in (TheftStatus.PICKED_UP,
+                                                      TheftStatus.TAKEN):
+                self.tracker.theft_status[obj_id] = TheftStatus.THEFT_CONFIRMED
+                self.log_event("THEFT_CONFIRMED",
+                               f"Person {person_id} exited with Object {obj_id}")
+                return obj_id
+
+        return None
+
+    # ------------------------------------------------------------------
+    def update_time_based_status(self):
+        """Promote PICKED_UP → TAKEN after TIME_BEFORE_ALERT seconds."""
+        current_time = time.time()
+        for obj_id, pickup_time in list(self.tracker.pickup_time.items()):
+            if (self.tracker.theft_status.get(obj_id) == TheftStatus.PICKED_UP
+                    and current_time - pickup_time > TIME_BEFORE_ALERT):
+                self.tracker.theft_status[obj_id] = TheftStatus.TAKEN
+                self.log_event("STATUS_UPDATE",
+                               f"Object {obj_id} marked as TAKEN")
+
+    # ------------------------------------------------------------------
+    @staticmethod
+    def calculate_suspicion_score(is_loitering, loiter_time, in_restricted):
+        score = 0
+        if is_loitering:
+            score += min(50, (loiter_time / LOITER_THRESHOLD) * 30)
+        if in_restricted:
+            score += 30
+        return min(100, score)
+
+    # ------------------------------------------------------------------
+    def check_protected_object(self, object_id, centroid):
+        """
+        Alert when a locked object has moved significantly AND a person is nearby.
+
+        FIX 5: Original accepted centroid but never used it — it re-read
+               self.tracker.bboxes and rebuilt objects from get_tracked_objects().
+               Now uses centroid directly for the person-proximity check and
+               accesses the snapshot from within the method via tracker state.
+        """
+        if object_id not in self.tracker.locked_objects:
+            return False
+
+        ref_box     = self.tracker.locked_objects[object_id]
+        current_box = self.tracker.bboxes[object_id]
+        iou         = calculate_iou(ref_box, current_box)
+
+        if iou >= 0.3:
+            # Object still in place — reset counter
+            self.tracker.protection_alerts[object_id] = 0
+            return False
+
+        self.tracker.protection_alerts[object_id] += 1
+
+        if self.tracker.protection_alerts[object_id] <= 5:
+            return False  # Need sustained displacement before alerting
+
+        # FIX 5: use the centroid param passed in (was unused before)
+        for pid in list(self.tracker.objects.keys()):
+            if self.tracker.classes.get(pid) != 'person':
+                continue
+            if centroid_distance(centroid, self.tracker.objects[pid]) < PICKUP_DISTANCE_THRESHOLD:
+                return True  # Protection alert!
+
+        return False
+
+# ============================================================================
+# MAIN
+# ============================================================================
+
+def main():
+    print("\n" + "=" * 80)
+    print("╔" + "=" * 78 + "╗")
+    print("║" + "ULTIMATE THEFT DETECTION SYSTEM v2.1 (FIXED)".center(78) + "║")
+    print("║" + "Multi-Strategy Hybrid Approach".center(78) + "║")
+    print("╚" + "=" * 78 + "╝")
+    print("=" * 80)
+
+    print("\nLoading YOLO model …")
+    try:
+        model = YOLO(MODEL_SIZE)
+        print("✓ YOLO loaded\n")
+    except Exception as exc:
+        print(f"❌ Could not load model: {exc}")
+        return
+
+    tracker        = ObjectTracker()
+    zone_manager   = ZoneManager()
+    theft_detector = TheftDetector(tracker, zone_manager)
+
+    print("📹 Opening camera …")
+    camera = cv2.VideoCapture(CAMERA_INDEX)
+    if not camera.isOpened():
+        print("❌ Cannot access camera!")
+        return
+    camera.set(cv2.CAP_PROP_FRAME_WIDTH,  CAMERA_WIDTH)
+    camera.set(cv2.CAP_PROP_FRAME_HEIGHT, CAMERA_HEIGHT)
+    print("✓ Camera opened\n")
+
+    # Zone drawing state
+    drawing_zone       = False
+    current_zone_type  = ZoneType.SECURE
+    current_zone_points= []
+    mouse_position     = [0, 0]
+
+    # FIX 8: explicit nonlocal for current_zone_points ensures closure is
+    #         unambiguous even if the list is ever reassigned inside the callback
+    def mouse_callback(event, x, y, flags, param):
+        nonlocal current_zone_points, drawing_zone, mouse_position
+        mouse_position[0] = x
+        mouse_position[1] = y
+        if drawing_zone and event == cv2.EVENT_LBUTTONDOWN:
+            current_zone_points.append([x, y])
+            print(f"  Point added: ({x}, {y})")
+
+    cv2.namedWindow('Ultimate Theft Detection System')
+    cv2.setMouseCallback('Ultimate Theft Detection System', mouse_callback)
+
+    frame_count         = 0
+    total_thefts        = 0
+    total_loitering     = 0
+    total_restricted    = 0
+    total_suspicious    = 0
+    total_protection    = 0
+    alert_active        = False
+    alert_message       = ""
+    alert_time          = 0.0
+    previous_object_ids = set()
+
+    print("=" * 80)
+    print("CONTROLS:")
+    print("  o = Draw SECURE zone (green)  |  e = Draw EXIT zone (red)")
+    print("  z = Draw RESTRICTED zone      |  l = Lock object under cursor")
+    print("  u = Unlock all locked objects |  c = Clear all zones")
+    print("  s = Save zones                |  q = Quit")
+    print("=" * 80 + "\n")
+
+    # ------------------------------------------------------------------ #
+    #  Helper: start / finish a zone drawing                               #
+    # ------------------------------------------------------------------ #
+    def _toggle_zone(zone_type, color_name):
+        """
+        FIX 9: If we're already drawing a *different* zone type we finish
+               that zone first.  Original code would abandon it silently.
+        """
+        nonlocal drawing_zone, current_zone_type, current_zone_points
+
+        if drawing_zone:
+            # Finish whatever zone was in progress
+            if len(current_zone_points) >= 3:
+                zone_manager.add_zone(current_zone_points,
+                                      current_zone_type)
+                print(f"✓ {current_zone_type.value.upper()} zone saved")
+            current_zone_points = []
+
+            if current_zone_type == zone_type:
+                # Same key pressed twice → just finish
+                drawing_zone = False
+                return
+
+        # Start new zone
+        drawing_zone      = True
+        current_zone_type = zone_type
+        current_zone_points = []
+        print(f"\n📍 Drawing {color_name} zone — click points, press key again to finish")
+
+    # ------------------------------------------------------------------ main loop
+    while True:
+        ret, frame = camera.read()
+        if not ret:
+            print("⚠ Frame capture failed — retrying …")
+            time.sleep(0.05)
+            continue
+
+        frame_count += 1
+        frame = cv2.flip(frame, 1)
+        image_height, image_width = frame.shape[:2]
+
+        # ---- YOLO detection ----
+        results = model(frame, conf=CONFIDENCE_THRESHOLD,
+                        iou=IOU_THRESHOLD, verbose=False)
+        detections = []
+        for result in results:
+            for box in result.boxes:
+                cls = int(box.cls[0])
+                if cls not in TRACKED_CLASSES:
+                    continue
+                x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
+                conf       = float(box.conf[0])
+                cx, cy     = int((x1 + x2) / 2), int((y1 + y2) / 2)
+                bbox       = (int(x1), int(y1), int(x2), int(y2))
+                detections.append(((cx, cy), bbox, TRACKED_CLASSES[cls], conf))
+
+        # ---- Update tracker ----
+        tracked_objects     = tracker.update(detections)
+        current_object_ids  = set(tracked_objects.keys())
+        new_object_ids      = current_object_ids - previous_object_ids
+        previous_object_ids = current_object_ids
+
+        # ---- Determine origin for newly appeared objects ----
+        for obj_id in new_object_ids:
+            if obj_id in tracked_objects:
+                obj_data = tracked_objects[obj_id]
+                # FIX 6: pass snapshot instead of letting the method call
+                #         get_tracked_objects() itself
+                theft_detector.determine_object_origin(
+                    obj_id, obj_data['centroid'], obj_data['class'],
+                    tracked_objects)
+
+        theft_detector.update_time_based_status()
+
+        # ---- Per-object analysis ----
+        for obj_id, obj_data in tracked_objects.items():
+            centroid     = obj_data['centroid']
+            bbox         = obj_data['bbox']
+            class_name   = obj_data['class']
+            confidence   = obj_data['confidence']
+            origin       = obj_data['origin']
+            theft_status = obj_data['theft_status']
+            is_locked    = obj_data['is_locked']
+
+            # Return check
+            if theft_status in (TheftStatus.PICKED_UP, TheftStatus.TAKEN):
+                theft_detector.check_item_returned(obj_id, centroid)
+
+            if class_name == 'person':
+                # Theft detection (FIX 7: pass snapshot)
+                theft_detector.check_person_object_interaction(
+                    obj_id, centroid, tracked_objects)
+
+                stolen_obj_id = theft_detector.check_theft_confirmation(
+                    obj_id, centroid)
+                if stolen_obj_id is not None:
+                    total_thefts += 1
+                    alert_active  = True
+                    alert_message = f"THEFT!  Person:{obj_id}  Item:{stolen_obj_id}"
+                    alert_time    = time.time()
+                    play_alert_sound(1200, 500)
+                    print(f"\n{'='*60}\n🚨 THEFT CONFIRMED!"
+                          f"\n   Person:{obj_id}  Item:{stolen_obj_id}"
+                          f"\n{'='*60}\n")
+
+                # Behavioral checks
+                is_loitering,  loiter_time  = tracker.check_loitering(obj_id)
+                in_restricted, _            = zone_manager.check_in_restricted_zone(centroid)
+                suspicion_score             = TheftDetector.calculate_suspicion_score(
+                                                is_loitering, loiter_time, in_restricted)
+
+                if is_loitering and not alert_active:
+                    total_loitering += 1
+                    alert_active     = True
+                    alert_message    = f"LOITERING  ID:{obj_id}  ({loiter_time:.0f}s)"
+                    alert_time       = time.time()
+                    play_alert_sound(900, 300)
+
+                if in_restricted and not alert_active:
+                    total_restricted += 1
+                    alert_active      = True
+                    alert_message     = f"RESTRICTED AREA  ID:{obj_id}"
+                    alert_time        = time.time()
+                    play_alert_sound(1400, 300)
+
+                if suspicion_score > 70 and not alert_active:
+                    total_suspicious += 1
+                    alert_active      = True
+                    alert_message     = f"SUSPICIOUS  ID:{obj_id}  ({int(suspicion_score)}%)"
+                    alert_time        = time.time()
+                    play_alert_sound(1000, 400)
+
+            # Object protection (FIX 5: centroid now used inside method)
+            if is_locked:
+                if theft_detector.check_protected_object(obj_id, centroid) and not alert_active:
+                    total_protection += 1
+                    alert_active      = True
+                    alert_message     = f"LOCKED OBJECT MOVED  ID:{obj_id}"
+                    alert_time        = time.time()
+                    play_alert_sound(1600, 400)
+
+            # ---- Bounding-box colour ----
+            if   theft_status == TheftStatus.THEFT_CONFIRMED: color = COLOR_STOLEN
+            elif theft_status == TheftStatus.TAKEN:           color = COLOR_DANGER
+            elif theft_status == TheftStatus.PICKED_UP:       color = COLOR_WARNING
+            elif is_locked:                                    color = COLOR_LOCKED
+            elif class_name == 'person':                       color = COLOR_PERSON
+            else:                                              color = COLOR_OBJECT
+
+            x1, y1, x2, y2 = bbox
+            cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+
+            # Label
+            parts = [f"ID:{obj_id}", class_name]
+            if SHOW_CONFIDENCE:
+                parts.append(f"{confidence:.2f}")
+            if is_locked:
+                parts.append("[LOCKED]")
+            if origin == ObjectOrigin.SECURE_ZONE:
+                parts.append("[STORE]")
+            elif origin == ObjectOrigin.WITH_PERSON:
+                parts.append("[PERSONAL]")
+            if   theft_status == TheftStatus.PICKED_UP:       parts.append("[PICKED]")
+            elif theft_status == TheftStatus.TAKEN:           parts.append("[TAKEN]")
+            elif theft_status == TheftStatus.THEFT_CONFIRMED: parts.append("[STOLEN!]")
+
+            label = " ".join(parts)
+            (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
+            cv2.rectangle(frame, (x1, y1 - th - 10), (x1 + tw, y1), color, -1)
+            cv2.putText(frame, label, (x1, y1 - 5),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, COLOR_TEXT, 1)
+
+        # ---- Draw zones ----
+        if SHOW_ZONES:
+            zone_manager.draw_zones(frame)
+
+        # ---- Draw in-progress zone ----
+        if drawing_zone and current_zone_points:
+            zone_color = {
+                ZoneType.SECURE:     COLOR_SECURE_ZONE,
+                ZoneType.EXIT:       COLOR_EXIT_ZONE,
+                ZoneType.RESTRICTED: COLOR_RESTRICTED_ZONE,
+            }[current_zone_type]
+            for i, pt in enumerate(current_zone_points):
+                cv2.circle(frame, tuple(pt), 5, zone_color, -1)
+                if i > 0:
+                    cv2.line(frame, tuple(current_zone_points[i-1]),
+                             tuple(pt), zone_color, 2)
+            # Live line from last point to cursor
+            if current_zone_points:
+                cv2.line(frame, tuple(current_zone_points[-1]),
+                         tuple(mouse_position), zone_color, 1)
+
+        # ---- Alert banner ----
+        if alert_active and time.time() - alert_time < 3.0:
+            cv2.rectangle(frame, (0, 0), (image_width, 65), COLOR_DANGER, -1)
+            cv2.putText(frame, f"🚨 {alert_message}", (10, 45),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, COLOR_TEXT, 2)
+            if ENABLE_VISUAL_ALERT:
+                overlay = frame.copy()
+                cv2.rectangle(overlay, (0, 0), (image_width, image_height),
+                              COLOR_DANGER, -1)
+                cv2.addWeighted(overlay, 0.15, frame, 0.85, 0, frame)
+        else:
+            alert_active = False
+
+        # ---- Statistics panel ----
+        if SHOW_STATISTICS:
+            store_items = sum(1 for o in tracked_objects.values()
+                              if o['origin'] == ObjectOrigin.SECURE_ZONE)
+            picked      = sum(1 for o in tracked_objects.values()
+                              if o['theft_status'] == TheftStatus.PICKED_UP)
+            taken       = sum(1 for o in tracked_objects.values()
+                              if o['theft_status'] == TheftStatus.TAKEN)
+            locked_cnt  = sum(1 for o in tracked_objects.values() if o['is_locked'])
+
+            panel_y = image_height - 200
+            cv2.rectangle(frame, (10, panel_y), (420, image_height - 10), (0, 0, 0), -1)
+            cv2.rectangle(frame, (10, panel_y), (420, image_height - 10), COLOR_NORMAL, 1)
+
+            stats = [
+                f"Tracked:{len(tracked_objects)}  Store:{store_items}  Locked:{locked_cnt}",
+                f"Picked:{picked}  Taken:{taken}",
+                f"Thefts:{total_thefts}  Loiter:{total_loitering}  Restricted:{total_restricted}",
+                f"Suspicious:{total_suspicious}  Protected:{total_protection}",
+                f"Zones  S:{len(zone_manager.secure_zones)}"
+                f"  E:{len(zone_manager.exit_zones)}"
+                f"  R:{len(zone_manager.restricted_zones)}",
+            ]
+            y = panel_y + 28
+            for text in stats:
+                cv2.putText(frame, text, (18, y),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.45, COLOR_TEXT, 1)
+                y += 32
+
+        # ---- HUD instruction ----
+        if drawing_zone:
+            hud = (f"Drawing {current_zone_type.value.upper()} | "
+                   f"Click to add points | Press key again to finish")
+        else:
+            hud = "o=Secure  e=Exit  z=Restrict  l=Lock  u=Unlock  c=Clear  s=Save  q=Quit"
+        cv2.putText(frame, hud, (10, 20),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, COLOR_TEXT, 1)
+
+        cv2.imshow('Ultimate Theft Detection System', frame)
+
+        # ---- Keyboard handling ----
+        key = cv2.waitKey(1) & 0xFF
+
+        if key == ord('q'):
+            print("\n⚠️  Shutting down …")
+            break
+
+        elif key == ord('o'):
+            _toggle_zone(ZoneType.SECURE, "SECURE (green)")
+
+        elif key == ord('e'):
+            _toggle_zone(ZoneType.EXIT, "EXIT (red)")
+
+        elif key == ord('z'):
+            _toggle_zone(ZoneType.RESTRICTED, "RESTRICTED (magenta)")
+
+        elif key == ord('l'):
+            mx, my = mouse_position
+            locked_any = False
+            for obj_id, obj_data in tracked_objects.items():
+                x1, y1, x2, y2 = obj_data['bbox']
+                if x1 <= mx <= x2 and y1 <= my <= y2:
+                    if tracker.lock_object(obj_id):
+                        print(f"✓ Locked Object {obj_id} ({obj_data['class']})")
+                        locked_any = True
+                        break
+            if not locked_any:
+                print("⚠ No object under cursor — hover over an object first.")
+
+        elif key == ord('u'):
+            n = len(tracker.locked_objects)
+            for oid in list(tracker.locked_objects.keys()):
+                tracker.unlock_object(oid)
+            print(f"✓ Unlocked {n} object(s)" if n else "⚠ No locked objects.")
+
+        elif key == ord('c'):
+            zone_manager.clear_zones()
+            print("✓ All zones cleared")
+
+        elif key == ord('s'):
+            zone_manager.save_zones()
+
+    # ---- Summary ----
+    print("\n" + "=" * 60)
+    print("SESSION SUMMARY")
+    print("=" * 60)
+    print(f"Frames processed : {frame_count}")
+    print(f"Thefts           : {total_thefts}")
+    print(f"Loitering        : {total_loitering}")
+    print(f"Restricted zone  : {total_restricted}")
+    print(f"Suspicious       : {total_suspicious}")
+    print(f"Protected missing: {total_protection}")
+    print(f"Events logged    : {len(theft_detector.theft_events)}")
+    print("=" * 60)
+
+    camera.release()
+    cv2.destroyAllWindows()
+    print("✅ System closed\n")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\n⚠️  Interrupted by user")
+        cv2.destroyAllWindows()
+    except Exception as exc:
+        import traceback
+        print(f"\n❌ Unexpected error: {exc}")
+        traceback.print_exc()
+        cv2.destroyAllWindows()
